@@ -1,0 +1,111 @@
+name: Build single
+on:
+  workflow_dispatch:
+    inputs:
+      choice:
+        type: choice
+        description: Choose a board
+        options:
+        - firefly-rk3399
+        - bananapi
+        - bananapim2plus
+        - bananapim64
+        - clearfogbase
+        - clearfogpro
+        - cubox-i
+        - helios4
+        - helios64
+        - jethubj100
+        - jethubj80
+        - jetson-nano
+        - khadas-edge
+        - khadas-vim1
+        - khadas-vim2
+        - khadas-vim3
+        - khadas-vim3l
+        - lafrite
+        - lepotato
+        - lime-a64
+        - lime2
+        - nanopct4
+        - nanopi-r1
+        - nanopi-r2c
+        - nanopi-r2s
+        - nanopi-r4s
+        - nanopik1plus
+        - nanopim4v2
+        - nanopineo
+        - nanopineo2black
+        - odroidc2
+        - odroidc4
+        - odroidhc4
+        - odroidn2
+        - odroidxu4
+        - orangepi-r1
+        - orangepi-r1plus
+        - orangepi3
+        - orangepi4
+        - orangepilite
+        - orangepilite2
+        - orangepione
+        - orangepioneplus
+        - orangepipc
+        - orangepipc2
+        - orangepipcplus
+        - orangepiplus
+        - orangepiplus2e
+        - orangepiprime
+        - orangepizero
+        - orangepizero2
+        - orangepizeroplus
+        - pinebook-a64
+        - pinebook-pro
+        - renegade
+        - rk322x-box
+        - rock-3a
+        - rpi4b
+        - station-m1
+        - station-p1
+        - tinkerboard
+        - uefi-arm64
+        - uefi-x86
+        - virtual-qemu
+        - xt-q8l-v10
+        - zeropi
+jobs:
+
+  fake:
+    runs-on: ubuntu-20.04
+    name: Source changes
+    #if: ${{ github.repository_owner == 'Armbian' }}
+    steps:
+      - run: |
+          echo "not empty" > changes
+      - uses: actions/upload-artifact@v2
+        with:
+          path: changes
+          name: changes
+          if-no-files-found: ignore
+
+  single:
+    needs: [ fake ]
+    uses: lyh802/armbian-build/.github/workflows/build-with-docker.yml@master
+
+    with:
+      variant: 'yes:stable'
+      runner: "ubuntu-20.04"
+      part: 1
+      of: 1      
+      include: 'grep -w ${{ github.event.inputs.choice }} | '
+      exclude: ''
+      uploading: true
+
+  cleanup:
+    runs-on: ubuntu-20.04
+    needs: [ single ]
+    #if: ${{ github.repository_owner == 'Armbian' }}
+    steps:
+      - uses: geekyeggo/delete-artifact@v1
+        with:
+          name: changes
+          failOnError: false
