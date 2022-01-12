@@ -1,0 +1,233 @@
+name: Build with Docker
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      sourcerepo:
+       required: true
+       type: string    
+      variant:
+       required: true
+       type: string
+      runner:
+        required: true
+        type: string
+      part:
+        required: true
+        type: number
+      of:
+        required: true
+        type: number
+      include:
+        required: false
+        type: string
+      exclude:
+        required: false
+        type: string
+      uploading:
+        type: string
+
+jobs:
+
+  Prepare:
+
+    name: targets
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{steps.list_dirs.outputs.matrix}}
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          repository: armbian/build
+          path: build
+          ref: ${{ inputs.sourcerepo }}
+          clean: false
+
+      - name: Remove previous artefacts if any
+        run: |
+          sudo rm -rf changes 2>/dev/null || true
+      - name: Download changes
+        uses: actions/download-artifact@v2
+        with:
+          name: changes
+
+      - name: Prepare matrix
+        id: list_dirs
+        run: |
+          var="${{ inputs.variant }}"
+          if [[ "$var" != *beta ]]; then
+            FILENAME="targets.conf | grep ${var%:*} | grep \"yes\|adv\""
+          else
+            FILENAME="targets-${var%:*}-beta.conf"
+            
+          fi
+          
+          # if we want to split more
+          # MATRIX=$(split --number=l/${{ inputs.part }}/${{ inputs.of }} <<<
+                  
+          MATRIX="cat build/config/"${FILENAME}" | grep -v \"^$\" | grep -v \"^#\" |  ${{ inputs.include }} ${{ inputs.exclude }}  cut -f1 -d ' ' | pr -t -n4 | tr -s '[:blank:]' ':' | cut -d\":\" -f2,3"
+          [ -s changes ] || unset MATRIX
+          echo ::set-output name=matrix::$(for x in $(eval $MATRIX); do echo $x; done|jq -cnR '[inputs | select(length>0)]' | jq)
+       
+  image:
+    needs: Prepare
+    if: ${{ needs.Prepare.outputs.matrix != '[]' && needs.Prepare.outputs.matrix != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ${{fromJson(needs.Prepare.outputs.matrix)}}
+
+    runs-on: ${{ inputs.runner }}
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          repository: armbian/build
+          path: build
+          ref: ${{ inputs.sourcerepo }} 
+          clean: false
+
+      - name: Checkout support scripts
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          repository: armbian/scripts
+          path: scripts
+          clean: false
+
+      - name: Sync
+        run: |
+          mkdir -p build/userpatches
+          sudo cp scripts/configs/* build/userpatches/
+          sudo mountpoint -q build/output/debs && sudo fusermount -u build/output/debs || true
+          sudo mountpoint -q build/output/debs-beta && sudo fusermount -u build/output/debs-beta || true
+          
+      - name: Pull Docker image
+        run: |
+          [[ -z $(command -v docker) ]] && sudo apt-get -yy install docker containerd docker.io
+          sudo docker kill $(sudo docker ps -q) 2>/dev/null || true          
+          sudo docker image rm $(sudo docker images | grep -v $(cat build/VERSION | sed 's/trunk.*/trunk/')"-$(dpkg --print-architecture)" | awk 'NR>1 {print $3}') 2> /dev/null || true 
+          sudo docker pull ghcr.io/armbian/build:$(cat build/VERSION  | sed 's/trunk.*/trunk/')"-$(dpkg --print-architecture)"
+          
+      - name: Fix permissions
+        run: |
+          # make sure no temporally dirs are mounted from previous runs
+          while :
+          do
+              sudo docker volume rm $(sudo docker volume ls -q) 2> /dev/null || true
+              sudo pkill compile.sh || true
+              sudo pkill arm-binfmt-P || true
+              sudo pkill aarch64-binfmt-P || true
+              sudo pkill pixz || true
+              if [[ $(curl -s http://ifconfig.me) == "93.103.15.56" || $(curl -s http://ifconfig.me) == "188.227.12.36" ]]; then
+                  sudo mountpoint -q build/cache/rootfs &&  sudo fusermount -u build/cache/rootfs || true
+                  sudo mountpoint -q build/cache/toolchain &&  sudo fusermount -u build/cache/toolchain || true
+              fi
+              sudo mountpoint -q build/output/images && sudo fusermount -u build/output/images || true
+              [[ "$(df | grep "/.tmp" | wc -l)" -eq 0 && $(sudo mountpoint -q build/output/images; echo $?) -eq 1 ]] && sudo rm -rf build/.tmp && break
+              echo "Mounted temp directories. Trying to unmount."
+              df | grep ".tmp" | awk '{print $6}' | xargs sudo umount 2>/dev/null || true
+              sleep 10
+          done
+          
+          [[ -d build/.git ]] && sudo chown -R $USER:$USER build/.git || true
+          [[ -d build/output/images ]] && sudo rm -rf build/output/images/* || true
+         
+      - name: Assemble
+        run: |
+          export TERM=dumb
+          cd build
+          # use local resources if possible
+          if [[ $(curl -s http://ifconfig.me) == "93.103.15.56" ]]; then
+              sudo rm -rf cache/toolchain/*
+              sudo mkdir -p cache/toolchain build/cache/rootfs || true
+              ! sudo mountpoint -q cache/toolchain && sudo mount nas:/tank/armbian/toolchain.armbian.com cache/toolchain -o rsize=32768,wsize=32768,timeo=5,retrans=2,actimeo=60,retry=15 || true
+              ! sudo mountpoint -q cache/rootfs && sudo mount nas:/tank/armbian/dl.armbian.com/_rootfs cache/rootfs -o rsize=32768,wsize=32768,timeo=5,retrans=2,actimeo=60,retry=15 || true
+          fi
+          
+          if [[ $(curl -s http://ifconfig.me) == "188.227.12.36" ]]; then              
+              sudo mkdir -p cache/toolchain build/cache/rootfs || true
+              ! sudo mountpoint -q cache/toolchain && sudo mount --bind /mnt/armbian/cache/toolchain/ cache/toolchain -o rsize=32768,wsize=32768,timeo=5,retrans=2,actimeo=60,retry=15 || true
+              ! sudo mountpoint -q cache/rootfs && sudo mount --bind /mnt/armbian/cache/rootfs/ cache/rootfs/ -o rsize=32768,wsize=32768,timeo=5,retrans=2,actimeo=60,retry=15 || true
+          fi
+          
+          var="${{ inputs.variant }}"
+          RC="no"
+          if [[ "$var" != *beta ]]; then
+            FILENAME="targets.conf | grep ${var%:*} | grep \"yes\|adv\""
+            SKIP_EXTERNAL_TOOLCHAINS="no"
+            REPOSITORY_INSTALL="kernel,armbian-bsp-desktop,armbian-desktop,armbian-config,armbian-firmware,armbian-zsh"
+            DEPLOYFOLDER=archive
+            if [[ "$var" == *rc ]]; then
+              RC="yes"
+              DEPLOYFOLDER=rc
+            fi
+          else
+            FILENAME="targets-${var%:*}-beta.conf"
+            DEPLOYFOLDER=nightly
+            SKIP_EXTERNAL_TOOLCHAINS="yes"
+            REPOSITORY_INSTALL="u-boot,kernel,armbian-bsp-cli,armbian-bsp-desktop,armbian-desktop,armbian-config,armbian-firmware,armbian-zsh"
+          fi
+          echo "DEPLOYFOLDER=$DEPLOYFOLDER" >> $GITHUB_ENV
+          var="${{ inputs.variant }}"
+          
+          if [[ "$var" != *beta ]]; then
+              BETA="no"
+              OLD="ghcr.io/armbian/build:$(cat VERSION  | sed 's/trunk.*/trunk/')"-$(dpkg --print-architecture)
+              sudo git checkout master              
+              sudo cp ../scripts/VERSION .
+              sudo docker tag $OLD ghcr.io/armbian/build:$(cat VERSION)-$(dpkg --print-architecture)
+              else
+              BETA="yes"
+          fi
+          CHUNK="${{ matrix.node }}"
+          LINE=$(echo $CHUNK | cut -d":" -f1)
+          BOARD=$(echo $CHUNK | cut -d":" -f2)
+          echo "BOARD=$BOARD" >> $GITHUB_ENV
+          LINIJA="cat config/${FILENAME} | grep -v \"^$\" | grep -v \"^#\" | ${{ inputs.include }} ${{ inputs.exclude }} sed -n ''$LINE'p'"
+          read -r BOARD BRANCH RELEASE BUILD_TARGET BUILD_STABILITY BUILD_IMAGE DESKTOP_ENVIRONMENT DESKTOP_ENVIRONMENT_CONFIG_NAME DESKTOP_APPGROUPS_SELECTED \
+          <<< $(eval $LINIJA)
+          DESKTOP_APPGROUPS_SELECTED="${DESKTOP_APPGROUPS_SELECTED//,/ }"
+          BUILD_DESKTOP="no"
+          BUILD_MINIMAL="no"
+          [[ ${BUILD_TARGET} == "desktop" ]] && BUILD_DESKTOP="yes"
+          [[ ${BUILD_TARGET} == "minimal" ]] && BUILD_MINIMAL="yes"
+          [[ ! -f .ignore_changes ]] && sudo touch .ignore_changes
+          sudo sed -i "s/-it --rm/-i --rm/" userpatches/config-docker.conf          
+          ./compile.sh \
+          BETA="${BETA}" \
+          RELEASE="${RELEASE}" \
+          KERNEL_ONLY="no" \
+          SKIP_EXTERNAL_TOOLCHAINS="$SKIP_EXTERNAL_TOOLCHAINS" \
+          DESKTOP_ENVIRONMENT_CONFIG_NAME="$DESKTOP_ENVIRONMENT_CONFIG_NAME" \
+          BUILD_DESKTOP="$BUILD_DESKTOP" \
+          BUILD_MINIMAL="$BUILD_MINIMAL" \
+          DESKTOP_ENVIRONMENT="${DESKTOP_ENVIRONMENT}" \
+          KERNEL_CONFIGURE="no" \
+          BOARD="$BOARD" \
+          RC="$RC" \
+          LOG_SUBPATH="debug/$BOARD" \
+          BRANCH="$BRANCH" \
+          MAKE_FOLDERS="yes" \
+          IMAGE_PRESENT="no" \
+          USE_MAINLINE_GOOGLE_MIRROR="yes" \
+          ARMBIAN_CACHE_TOOLCHAIN_PATH="${ARMBIAN_CACHE_TOOLCHAIN_PATH}" \
+          ARMBIAN_CACHE_ROOTFS_PATH="${ARMBIAN_CACHE_ROOTFS_PATH}" \
+          REPOSITORY_INSTALL="$REPOSITORY_INSTALL" \
+          DESKTOP_APPGROUPS_SELECTED="$DESKTOP_APPGROUPS_SELECTED" \
+          EXPERT="yes"
+          
+          sudo chown -R $USER.$USER output/images/$BOARD 2> /dev/null || true
+          sudo chmod 644 output/images/$BOARD/*/*.xz  2> /dev/null || true
+
+      - name: Upload artefacts
+        if: inputs.uploading == 'true' && env.UPLOAD == 'true'
+        uses: actions/upload-artifact@v2
+        with:
+          name: Armbian
+          path: build/output/debug
